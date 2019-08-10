@@ -118,3 +118,4 @@ mpiexec -n 8 python train.py --problem cifar10 --image_size 32 --n_level 3 --dep
 ```
 mpiexec -n 8 python train.py --problem imagenet --image_size 32 --n_level 3 --depth 48 --flow_permutation 2 --flow_coupling 0 --seed 0 --learntop --lr 0.001 --n_bits_x 5 --ycond --weight_y=0.01
 ```
+# Glow
