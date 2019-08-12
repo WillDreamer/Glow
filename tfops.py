@@ -452,8 +452,9 @@ def gaussian_diag(mean, logsd):
         (np.log(2 * np.pi) + 2. * logsd + (x - mean) ** 2 / tf.exp(2. * logsd))
     o.logp = lambda x: flatten_sum(o.logps(x))
     o.get_eps = lambda x: (x - mean) / tf.exp(logsd)
+    
     return o
-
+    
 
 # def discretized_logistic_old(mean, logscale, binsize=1 / 256.0, sample=None):
 #    scale = tf.exp(logscale)

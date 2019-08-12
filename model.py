@@ -5,7 +5,7 @@ import optim
 import numpy as np
 import horovod.tensorflow as hvd
 from tensorflow.contrib.framework.python.ops import add_arg_scope
-
+import os
 
 '''
 f_loss: function with as input the (x,y,reuse=False), and as output a list/tuple whose first element is the loss.
@@ -22,7 +22,8 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
     m.lr = lr
 
     # === Loss and optimizer
-    loss_train, stats_train = f_loss(train_iterator, True)
+    loss_train, stats_train,logdet_out,logpz_out = f_loss(train_iterator, True)
+    m.logdet_out = sess.run(logdet_out)
     all_params = tf.trainable_variables()
     if hps.gradient_checkpointing == 1:
         from memory_saving_gradients import gradients
@@ -47,7 +48,8 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
     m.polyak_swap = lambda: sess.run(polyak_swap_op)
 
     # === Testing
-    loss_test, stats_test = f_loss(test_iterator, False, reuse=True)
+    loss_test, stats_test,logdet_out,logpz_out = f_loss(test_iterator, False, reuse=True)
+    
     if hps.direct_iterator:
         m.test = lambda: sess.run(stats_test)
     else:
@@ -56,7 +58,7 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
             return sess.run(stats_test, {feeds['x']: _x,
                                          feeds['y']: _y})
         m.test = _test
-
+    m.logpz_out =sess.run(logpz_out)
     # === Saving and restoring
     saver = tf.train.Saver()
     saver_ema = tf.train.Saver(ema.variables_to_restore())
@@ -64,6 +66,15 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
         sess, path, write_meta_graph=False)
     m.save = lambda path: saver.save(sess, path, write_meta_graph=False)
     m.restore = lambda path: saver.restore(sess, path)
+    
+    '''
+    # === Tensorboard
+    tensorboard_dir='tensorboard/'
+    if not os.path.exists(tensorboard_dir):
+        os.makedirs(tensorboard_dir)
+
+    tf
+    '''
 
     # === Initialize the parameters
     if hps.restore_path != '':
@@ -71,6 +82,7 @@ def abstract_model_xy(sess, hps, feeds, train_iterator, test_iterator, data_init
     else:
         with Z.arg_scope([Z.get_variable_ddi, Z.actnorm], init=True):
             results_init = f_loss(None, True, reuse=True)
+            
         sess.run(tf.global_variables_initializer())
         sess.run(results_init, {feeds['x']: data_init['x'],
                                 feeds['y']: data_init['y']})
@@ -84,19 +96,19 @@ def codec(hps):
     def encoder(z, objective):
         eps = []
         for i in range(hps.n_levels):
-            z, objective = revnet2d(str(i), z, objective, hps)
+            z, objective, logdet_out = revnet2d(str(i), z, objective, hps)
             if i < hps.n_levels-1:
                 z, objective, _eps = split2d("pool"+str(i), z, objective=objective)
                 eps.append(_eps)
-        return z, objective, eps
+        return z, objective, eps, logdet_out
 
     def decoder(z, eps=[None]*hps.n_levels, eps_std=None):
         for i in reversed(range(hps.n_levels)):
             if i < hps.n_levels-1:
                 z = split2d_reverse("pool"+str(i), z, eps=eps[i], eps_std=eps_std)
-            z, _ = revnet2d(str(i), z, 0, hps, reverse=True)
+            z, _,logdet_out = revnet2d(str(i), z, 0, hps, reverse=True)
 
-        return z
+        return z,logdet_out
 
     return encoder, decoder
 
@@ -107,6 +119,7 @@ def prior(name, y_onehot, hps):
         n_z = hps.top_shape[-1]
 
         h = tf.zeros([tf.shape(y_onehot)[0]]+hps.top_shape[:2]+[2*n_z])
+        #三个维度的拼接
         if hps.learntop:
             h = Z.conv2d_zeros('p', h, 2*n_z)
         if hps.ycond:
@@ -114,8 +127,10 @@ def prior(name, y_onehot, hps):
                                            2*n_z), [-1, 1, 1, 2 * n_z])
 
         pz = Z.gaussian_diag(h[:, :, :, :n_z], h[:, :, :, n_z:])
-
+        #gaussian_diag返回一个类别的属性
+        #pz就是对角矩阵
     def logp(z1):
+        #
         objective = pz.logp(z1)
         return objective
 
@@ -159,6 +174,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
 
     def postprocess(x):
         return tf.cast(tf.clip_by_value(tf.floor((x + .5)*hps.n_bins)*(256./hps.n_bins), 0, 255), 'uint8')
+                        #tf.clip_by_value将值限制在0，255之间
 
     def _f_loss(x, y, is_training, reuse=False):
 
@@ -173,13 +189,14 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
 
             # Encode
             z = Z.squeeze2d(z, 2)  # > 16x16x12
-            z, objective, _ = encoder(z, objective)
-
+            z, objective, _, logdet_out = encoder(z, objective)
+            
             # Prior
             hps.top_shape = Z.int_shape(z)[1:]
             logp, _, _ = prior("prior", y_onehot, hps)
             objective += logp(z)
-
+            logpz_out = logp(z)
+            
             # Generative loss
             nobj = - objective
             bits_x = nobj / (np.log(2.) * int(x.get_shape()[1]) * int(
@@ -194,7 +211,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
                 bits_y = tf.nn.softmax_cross_entropy_with_logits_v2(
                     labels=y_onehot, logits=y_logits) / np.log(2.)
 
-                # Classification accuracy
+                #分类准确率
                 y_predicted = tf.argmax(y_logits, 1, output_type=tf.int32)
                 classification_error = 1 - \
                     tf.cast(tf.equal(y_predicted, y), tf.float32)
@@ -202,7 +219,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
                 bits_y = tf.zeros_like(bits_x)
                 classification_error = tf.ones_like(bits_x)
 
-        return bits_x, bits_y, classification_error
+        return bits_x, bits_y, classification_error,logdet_out, logpz_out
 
     def f_loss(iterator, is_training, reuse=False):
         if hps.direct_iterator and iterator is not None:
@@ -210,13 +227,13 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
         else:
             x, y = X, Y
 
-        bits_x, bits_y, pred_loss = _f_loss(x, y, is_training, reuse)
+        bits_x, bits_y, pred_loss, logdet_out,logpz_out = _f_loss(x, y, is_training, reuse)
         local_loss = bits_x + hps.weight_y * bits_y
         stats = [local_loss, bits_x, bits_y, pred_loss]
         global_stats = Z.allreduce_mean(
             tf.stack([tf.reduce_mean(i) for i in stats]))
 
-        return tf.reduce_mean(local_loss), global_stats
+        return tf.reduce_mean(local_loss), global_stats,logdet_out,logpz_out
 
     feeds = {'x': X, 'y': Y}
     m = abstract_model_xy(sess, hps, feeds, train_iterator,
@@ -226,22 +243,23 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
     def f_sample(y, eps_std):
         with tf.variable_scope('model', reuse=True):
             y_onehot = tf.cast(tf.one_hot(y, hps.n_y, 1, 0), 'float32')
-
             _, sample, _ = prior("prior", y_onehot, hps)
             z = sample(eps_std=eps_std)
-            z = decoder(z, eps_std=eps_std)
+            z,logdet_out = decoder(z, eps_std=eps_std)
             z = Z.unsqueeze2d(z, 2)  # 8x8x12 -> 16x16x3
             x = postprocess(z)
 
-        return x
+        return x,logdet_out
 
     m.eps_std = tf.placeholder(tf.float32, [None], name='eps_std')
-    x_sampled = f_sample(Y, m.eps_std)
+    x_sampled,logdet_out = f_sample(Y, m.eps_std)
 
     def sample(_y, _eps_std):
         return m.sess.run(x_sampled, {Y: _y, m.eps_std: _eps_std})
+   
+    
     m.sample = sample
-
+    m.logdet_out = sess.run(logdet_out)
     if hps.inference:
         # === Encoder-Decoder functions
         def f_encode(x, y, reuse=True):
@@ -256,7 +274,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
 
                 # Encode
                 z = Z.squeeze2d(z, 2)  # > 16x16x12
-                z, objective, eps = encoder(z, objective)
+                z, objective, eps, logdet_out = encoder(z, objective)
 
                 # Prior
                 hps.top_shape = Z.int_shape(z)[1:]
@@ -264,7 +282,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
                 objective += logp(z)
                 eps.append(_eps(z))
 
-            return eps
+            return eps,logdet_out
 
         def f_decode(y, eps, reuse=True):
             with tf.variable_scope('model', reuse=reuse):
@@ -278,7 +296,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
 
             return x
 
-        enc_eps = f_encode(X, Y)
+        enc_eps,logdet_out = f_encode(X, Y)
         dec_eps = []
         print(enc_eps)
         for i, _eps in enumerate(enc_eps):
@@ -314,7 +332,7 @@ def model(sess, hps, train_iterator, test_iterator, data_init):
 
         m.encode = encode
         m.decode = decode
-
+        m.logdet_out = logdet_out
     return m
 
 
@@ -335,12 +353,12 @@ def revnet2d(name, z, logdet, hps, reverse=False):
         if not reverse:
             for i in range(hps.depth):
                 z, logdet = checkpoint(z, logdet)
-                z, logdet = revnet2d_step(str(i), z, logdet, hps, reverse)
+                z, logdet,logdet_out = revnet2d_step(str(i), z, logdet, hps, reverse)
             z, logdet = checkpoint(z, logdet)
         else:
             for i in reversed(range(hps.depth)):
-                z, logdet = revnet2d_step(str(i), z, logdet, hps, reverse)
-    return z, logdet
+                z, logdet,logdet_out = revnet2d_step(str(i), z, logdet, hps, reverse)
+    return z, logdet,logdet_out
 
 # Simpler, new version
 @add_arg_scope
@@ -360,7 +378,7 @@ def revnet2d_step(name, z, logdet, hps, reverse):
             elif hps.flow_permutation == 1:
                 z = Z.shuffle_features("shuffle", z)
             elif hps.flow_permutation == 2:
-                z, logdet = invertible_1x1_conv("invconv", z, logdet)
+                z, logdet, logdet_out = invertible_1x1_conv("invconv", z, logdet)
             else:
                 raise Exception()
 
@@ -407,14 +425,14 @@ def revnet2d_step(name, z, logdet, hps, reverse):
             elif hps.flow_permutation == 1:
                 z = Z.shuffle_features("shuffle", z, reverse=True)
             elif hps.flow_permutation == 2:
-                z, logdet = invertible_1x1_conv(
+                z, logdet, logdet_out = invertible_1x1_conv(
                     "invconv", z, logdet, reverse=True)
             else:
                 raise Exception()
 
             z, logdet = Z.actnorm("actnorm", z, logdet=logdet, reverse=True)
 
-    return z, logdet
+    return z, logdet, logdet_out
 
 
 def f(name, h, width, n_out=None):
@@ -453,7 +471,8 @@ def invertible_1x1_conv(name, z, logdet, reverse=False):
             # dlogdet = tf.linalg.LinearOperator(w).log_abs_determinant() * shape[1]*shape[2]
             dlogdet = tf.cast(tf.log(abs(tf.matrix_determinant(
                 tf.cast(w, 'float64')))), 'float32') * shape[1]*shape[2]
-
+            #将dlogdet单独输出
+            logdet_out = dlogdet
             if not reverse:
 
                 _w = tf.reshape(w, [1, 1] + w_shape)
@@ -461,7 +480,7 @@ def invertible_1x1_conv(name, z, logdet, reverse=False):
                                  'SAME', data_format='NHWC')
                 logdet += dlogdet
 
-                return z, logdet
+                return z, logdet, logdet_out
             else:
 
                 _w = tf.matrix_inverse(w)
@@ -470,7 +489,7 @@ def invertible_1x1_conv(name, z, logdet, reverse=False):
                                  'SAME', data_format='NHWC')
                 logdet -= dlogdet
 
-                return z, logdet
+                return z, logdet,logdet_out
 
     else:
 
@@ -529,17 +548,20 @@ def invertible_1x1_conv(name, z, logdet, reverse=False):
                 w = tf.reshape(w, [1, 1] + w_shape)
                 z = tf.nn.conv2d(z, w, [1, 1, 1, 1],
                                  'SAME', data_format='NHWC')
-                logdet += tf.reduce_sum(log_s) * (shape[1]*shape[2])
-
-                return z, logdet
+                
+                dlogdet = tf.reduce_sum(log_s) * (shape[1]*shape[2])
+                logdet_out = dlogdet
+                logdet += dlogdet
+                return z, logdet, logdet_out
             else:
 
                 w_inv = tf.reshape(w_inv, [1, 1]+w_shape)
                 z = tf.nn.conv2d(
                     z, w_inv, [1, 1, 1, 1], 'SAME', data_format='NHWC')
-                logdet -= tf.reduce_sum(log_s) * (shape[1]*shape[2])
-
-                return z, logdet
+                dlogdet = tf.reduce_sum(log_s) * (shape[1]*shape[2])
+                logdet -= dlogdet
+                logdet_out = dlogdet
+                return z, logdet,logdet_out
 
 
 @add_arg_scope
@@ -579,6 +601,6 @@ def split2d_prior(z):
     n_z1 = n_z2
     h = Z.conv2d_zeros("conv", z, 2 * n_z1)
 
-    mean = h[:, :, :, 0::2]
+    mean = h[:, :, :, 0::2] #两个冒号表示步长
     logs = h[:, :, :, 1::2]
     return Z.gaussian_diag(mean, logs)

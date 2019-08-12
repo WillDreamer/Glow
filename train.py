@@ -153,7 +153,7 @@ def main(hps):
 
     # Create model
     import model
-    model = model.model(sess, hps, train_iterator, test_iterator, data_init)
+    model = model.model(sess,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   , train_iterator, test_iterator, data_init)
 
     # Initialize visualization functions
     visualise = init_visualizations(hps, model, logdir)
@@ -197,7 +197,7 @@ def train(sess, model, hps, logdir, visualise):
     _print(hps)
     _print('Starting training. Logging to', logdir)
     _print('epoch n_processed n_images ips dtrain dtest dsample dtot train_results test_results msg')
-
+    print('Confirmed training!')
     # Train
     sess.graph.finalize()
     n_processed = 0
@@ -210,11 +210,15 @@ def train(sess, model, hps, logdir, visualise):
         test_logger = ResultLogger(logdir + "test.txt", **hps.__dict__)
 
     tcurr = time.time()
+    
     for epoch in range(1, hps.epochs):
-
+        #logdet_out.append(model.logdet_out)
         t = time.time()
-
+        logdet_out = []
+        logpz_out =[]
         train_results = []
+        logdet_out += [model.logdet_out]
+        logpz_out +=[model.logpz_out]
         for it in range(hps.train_its):
 
             # Set learning rate, linearly annealed from 0 in the first hps.epochs_warmup epochs.
@@ -281,7 +285,10 @@ def train(sess, model, hps, logdir, visualise):
                     ips, dtrain, dtest, dsample, dcurr), train_results, test_results, msg)
 
             # model.polyak_swap()
-
+    tf.initialize_all_variables().run()
+    with tf.Session() as sess:
+        print('The logdet_out is {}'.format(sess.run(logdet_out)))
+        #logpz prepare to be processed 
     if hvd.rank() == 0:
         _print("Finished!")
 
@@ -412,3 +419,7 @@ if __name__ == "__main__":
 
     hps = parser.parse_args()  # So error if typo
     main(hps)
+
+
+    #加上存储路径
+    
